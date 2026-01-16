@@ -575,7 +575,7 @@ BEGIN
 END;
 /
 
--- Insert Employees with Indian Names
+-- Insert Employees
 BEGIN
     -- IT Department
     payroll_pkg.add_employee('Rajesh Kumar', 'rajesh.kumar@company.com', '9876543210', 
