@@ -1,0 +1,215 @@
+-- 05_procedures.sql
+-- Stored procedures implemented using Snowflake Scripting (LANGUAGE SQL).
+-- Naming convention: EMP_MANAGEMENT__<ACTION>
+
+USE DATABASE EMP_MGMT_DB;
+USE SCHEMA EMP_MGMT;
+
+CREATE OR REPLACE PROCEDURE EMP_MANAGEMENT__HIRE_EMPLOYEE(
+  P_EMP_ID NUMBER,
+  P_FIRST_NAME VARCHAR,
+  P_LAST_NAME VARCHAR,
+  P_EMAIL VARCHAR,
+  P_SALARY NUMBER,
+  P_DEPT_ID NUMBER,
+  P_HIRE_DATE DATE
+)
+RETURNS VARIANT
+LANGUAGE SQL
+EXECUTE AS CALLER
+AS
+$$
+DECLARE
+  V_EMP_ID NUMBER;
+  V_CNT    NUMBER;
+BEGIN
+  -- Basic validations (business rules)
+  IF P_FIRST_NAME IS NULL OR P_LAST_NAME IS NULL THEN
+    RAISE STATEMENT_ERROR WITH MESSAGE => 'First name and last name are required.';
+  END IF;
+
+  IF P_SALARY IS NULL OR P_SALARY <= 0 THEN
+    RAISE STATEMENT_ERROR WITH MESSAGE => 'Salary must be > 0.';
+  END IF;
+
+  IF P_DEPT_ID IS NULL THEN
+    RAISE STATEMENT_ERROR WITH MESSAGE => 'Department is required.';
+  END IF;
+
+  -- Hire date rule (cannot be in future)
+  IF P_HIRE_DATE IS NOT NULL AND P_HIRE_DATE > CURRENT_DATE() THEN
+    RAISE STATEMENT_ERROR WITH MESSAGE => 'Hire date cannot be in future.';
+  END IF;
+
+  -- Department must exist
+  SELECT COUNT(*) INTO V_CNT
+  FROM DEPARTMENTS
+  WHERE DEPARTMENT_ID = P_DEPT_ID;
+
+  IF V_CNT = 0 THEN
+    RAISE STATEMENT_ERROR WITH MESSAGE => 'Invalid department_id (department not found).';
+  END IF;
+
+  -- Email uniqueness check (UNIQUE constraints are informational)
+  IF P_EMAIL IS NOT NULL THEN
+    SELECT COUNT(*) INTO V_CNT
+    FROM EMPLOYEES
+    WHERE EMAIL = P_EMAIL;
+
+    IF V_CNT > 0 THEN
+      RAISE STATEMENT_ERROR WITH MESSAGE => 'Email already exists.';
+    END IF;
+  END IF;
+
+  -- Generate employee id if null
+  IF P_EMP_ID IS NULL THEN
+    SELECT SEQ_EMPLOYEE_ID.NEXTVAL INTO V_EMP_ID;
+  ELSE
+    V_EMP_ID := P_EMP_ID;
+  END IF;
+
+  -- Insert
+  INSERT INTO EMPLOYEES (
+    EMPLOYEE_ID, FIRST_NAME, LAST_NAME, EMAIL, SALARY, DEPARTMENT_ID, HIRE_DATE
+  )
+  VALUES (
+    V_EMP_ID, P_FIRST_NAME, P_LAST_NAME, P_EMAIL, P_SALARY, P_DEPT_ID,
+    COALESCE(P_HIRE_DATE, CURRENT_DATE())
+  );
+
+  RETURN OBJECT_CONSTRUCT('status', 'OK', 'employee_id', V_EMP_ID);
+END;
+$$;
+
+
+CREATE OR REPLACE PROCEDURE EMP_MANAGEMENT__UPDATE_SALARY(
+  P_EMP_ID NUMBER,
+  P_NEW_SALARY NUMBER
+)
+RETURNS VARIANT
+LANGUAGE SQL
+EXECUTE AS CALLER
+AS
+$$
+DECLARE
+  V_CNT NUMBER;
+BEGIN
+  IF P_EMP_ID IS NULL THEN
+    RAISE STATEMENT_ERROR WITH MESSAGE => 'Employee id is required.';
+  END IF;
+
+  IF P_NEW_SALARY IS NULL OR P_NEW_SALARY <= 0 THEN
+    RAISE STATEMENT_ERROR WITH MESSAGE => 'New salary must be > 0.';
+  END IF;
+
+  -- Ensure employee exists
+  SELECT COUNT(*) INTO V_CNT
+  FROM EMPLOYEES
+  WHERE EMPLOYEE_ID = P_EMP_ID;
+
+  IF V_CNT = 0 THEN
+    RAISE STATEMENT_ERROR WITH MESSAGE => 'Employee not found.';
+  END IF;
+
+  -- Update
+  UPDATE EMPLOYEES
+  SET SALARY = P_NEW_SALARY
+  WHERE EMPLOYEE_ID = P_EMP_ID;
+
+  -- Salary audit is handled via STREAM + TASK (see 06_streams_tasks.sql)
+  RETURN OBJECT_CONSTRUCT('status', 'OK', 'employee_id', P_EMP_ID, 'new_salary', P_NEW_SALARY);
+END;
+$$;
+
+
+CREATE OR REPLACE PROCEDURE EMP_MANAGEMENT__TERMINATE_EMPLOYEE(
+  P_EMP_ID NUMBER
+)
+RETURNS VARIANT
+LANGUAGE SQL
+EXECUTE AS CALLER
+AS
+$$
+DECLARE
+  V_CNT NUMBER;
+BEGIN
+  IF P_EMP_ID IS NULL THEN
+    RAISE STATEMENT_ERROR WITH MESSAGE => 'Employee id is required.';
+  END IF;
+
+  SELECT COUNT(*) INTO V_CNT
+  FROM EMPLOYEES
+  WHERE EMPLOYEE_ID = P_EMP_ID;
+
+  IF V_CNT = 0 THEN
+    RAISE STATEMENT_ERROR WITH MESSAGE => 'Employee not found.';
+  END IF;
+
+  DELETE FROM EMPLOYEES
+  WHERE EMPLOYEE_ID = P_EMP_ID;
+
+  RETURN OBJECT_CONSTRUCT('status', 'OK', 'employee_id', P_EMP_ID, 'action', 'TERMINATED');
+END;
+$$;
+
+
+-- Cursor-style demo: iterate employees for a department and compute bonus per employee.
+CREATE OR REPLACE PROCEDURE EMP_MANAGEMENT__BONUS_REPORT_BY_DEPT(
+  P_DEPT_ID NUMBER,
+  P_BONUS_PERCENT NUMBER
+)
+RETURNS VARIANT
+LANGUAGE SQL
+EXECUTE AS CALLER
+AS
+$$
+DECLARE
+  V_TOTAL_BONUS NUMBER(18,2) := 0;
+  V_ROWS        ARRAY;
+  REC           RESULTSET;
+BEGIN
+  IF P_DEPT_ID IS NULL THEN
+    RAISE STATEMENT_ERROR WITH MESSAGE => 'Department id is required.';
+  END IF;
+
+  IF P_BONUS_PERCENT IS NULL OR P_BONUS_PERCENT < 0 THEN
+    RAISE STATEMENT_ERROR WITH MESSAGE => 'Bonus percent must be >= 0.';
+  END IF;
+
+  REC := (
+    SELECT EMPLOYEE_ID, FIRST_NAME, LAST_NAME, SALARY
+    FROM EMPLOYEES
+    WHERE DEPARTMENT_ID = P_DEPT_ID
+    ORDER BY SALARY DESC
+  );
+
+  FOR CUR IN REC DO
+    DECLARE
+      V_BONUS NUMBER(18,2);
+    BEGIN
+      V_BONUS := ROUND(CUR.SALARY * P_BONUS_PERCENT, 2);
+      V_TOTAL_BONUS := V_TOTAL_BONUS + V_BONUS;
+
+      V_ROWS := ARRAY_APPEND(
+        COALESCE(V_ROWS, ARRAY_CONSTRUCT()),
+        OBJECT_CONSTRUCT(
+          'employee_id', CUR.EMPLOYEE_ID,
+          'first_name',  CUR.FIRST_NAME,
+          'last_name',   CUR.LAST_NAME,
+          'salary',      CUR.SALARY,
+          'bonus',       V_BONUS
+        )
+      );
+    END;
+  END FOR;
+
+  RETURN OBJECT_CONSTRUCT(
+    'status',        'OK',
+    'department_id', P_DEPT_ID,
+    'bonus_percent', P_BONUS_PERCENT,
+    'total_bonus',   V_TOTAL_BONUS,
+    'employees',     COALESCE(V_ROWS, ARRAY_CONSTRUCT())
+  );
+END;
+$$;
+
